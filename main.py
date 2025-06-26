@@ -11,8 +11,10 @@ from database import (get_filtered_movies, get_movie_details, update_movie_poste
                       add_new_tag, assign_tag_to_movie, remove_tag_from_movie,
                       rename_tag, delete_tag)
 from PIL import Image
+import functools
 
 IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif']
+VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm')
 IMAGE_FILE_COUNT_THRESHOLD = 30
 IMAGE_PERCENTAGE_THRESHOLD = 0.8
 
@@ -142,14 +144,46 @@ class GlobalTagManagerWindow(ctk.CTkToplevel):
         self.destroy()
 
 
+class ContextMenu(ctk.CTkFrame):
+    def __init__(self, master):
+        super().__init__(master, corner_radius=8)
+        self.copy_button = ctk.CTkButton(self, text="Copy", command=self.copy_text, width=100)
+        self.copy_button.pack(padx=5, pady=5)
+        self.widget_to_copy_from = None
+
+    def copy_text(self):
+        if self.widget_to_copy_from:
+            try:
+                text = self.widget_to_copy_from.get()
+                self.master.clipboard_clear()
+                self.master.clipboard_append(text)
+                print(f"Copied to clipboard: {text}")
+            except Exception as e:
+                print(f"Could not copy text: {e}")
+        self.hide()
+
+    def show(self, event, widget):
+        self.widget_to_copy_from = widget
+        self.place(x=event.x_root - self.master.winfo_rootx(), 
+                   y=event.y_root - self.master.winfo_rooty())
+        self.lift()
+
+    def hide(self, event=None):
+        self.place_forget()
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.current_selected_movie_id = None
+        self.current_folder_path = None  # путь к папке выбранного фильма
         self.tag_editor_window = None
         self.global_tag_manager_window = None
         self.active_filter_tags = set()
         self.tag_checkboxes = {}
+        self.preview_window = None
+        self.preview_after_id = None
+        self.view_mode = "list"  # режим отображения: list или grid
         self.title("My Media Library")
         self.geometry("1400x750")
         self.grid_columnconfigure(1, weight=1)
@@ -178,14 +212,18 @@ class App(ctk.CTk):
         self.clear_filters_button.pack(padx=20, pady=10, side="bottom", fill="x")
         self.movie_list_frame = ctk.CTkScrollableFrame(self, label_text="Titles")
         self.movie_list_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
+        self.toggle_view_button = ctk.CTkButton(self.movie_list_frame, text="Grid View", command=self.toggle_view_mode)
+        self.toggle_view_button.pack(pady=5, padx=5, anchor="ne")
+        self.grid_container = None  # контейнер для плиток
         self.details_frame = ctk.CTkFrame(self)
         self.details_frame.grid(row=0, column=2, padx=10, pady=10, sticky="nsew")
         self.details_frame.grid_columnconfigure(0, weight=1)
         placeholder_path = create_placeholder_image_if_not_exists()
         self.placeholder_image = ctk.CTkImage(Image.open(placeholder_path), size=(250, 375))
         self.details_poster_label = ctk.CTkLabel(self.details_frame, text="No Poster", image=self.placeholder_image,
-                                                 compound="center")
+                                                 compound="center", cursor="hand2")
         self.details_poster_label.pack(pady=10, padx=10)
+        self.details_poster_label.bind("<Button-3>", self.open_current_movie_folder)  # ПКМ для открытия папки
         self.details_poster_label.image = self.placeholder_image
         self.title_string_var = ctk.StringVar()
         self.details_title_entry = ctk.CTkEntry(self.details_frame, textvariable=self.title_string_var,
@@ -223,6 +261,10 @@ class App(ctk.CTk):
         self.disable_details_buttons()
         self.populate_sidebar_tags()
         self.refresh_movie_list()
+        self.context_menu = ContextMenu(self)
+        self.bind("<Button-1>", self.context_menu.hide)
+        self.bind_all_children(self.sidebar_frame, "<Button-2>", self.open_current_movie_folder)
+        self.bind("<Control-c>", self._handle_global_copy)
 
     def populate_sidebar_tags(self):
         for widget in self.tag_filter_frame.winfo_children(): widget.destroy()
@@ -244,19 +286,156 @@ class App(ctk.CTk):
         self.apply_filters()
 
     def refresh_movie_list(self, tags_to_filter=None):
-        for widget in self.movie_list_frame.winfo_children(): widget.destroy()
+        # Удаляем все виджеты кроме кнопки-переключателя и grid_container (если есть)
+        for widget in self.movie_list_frame.winfo_children():
+            if widget is not self.toggle_view_button and widget is not self.grid_container:
+                widget.destroy()
+        # Удаляем grid_container, если он был создан ранее
+        if self.grid_container is not None:
+            self.grid_container.destroy()
+            self.grid_container = None
         movies = get_filtered_movies(tags_to_filter)
-        for movie_id, title, folder_path in movies:
-            movie_frame = ctk.CTkFrame(self.movie_list_frame, corner_radius=5, fg_color="transparent")
-            movie_frame.pack(pady=2, padx=5, fill="x")
-            title_var = ctk.StringVar(value=title)
-            title_entry = ctk.CTkEntry(movie_frame, textvariable=title_var, state="readonly", border_width=0,
-                                       fg_color="transparent", font=ctk.CTkFont(size=14))
-            title_entry.pack(side="left", padx=10, pady=5, fill="x", expand=True)
-            title_entry.bind("<Button-2>", lambda e, path=folder_path: self.open_folder_in_explorer(path))
-            title_entry.bind("<Button-1>", lambda e, mid=movie_id: self.show_movie_details(mid))
-            movie_frame.bind("<Enter>", lambda e, w=movie_frame: w.configure(fg_color=("#333333", "#555555")))
-            movie_frame.bind("<Leave>", lambda e, w=movie_frame: w.configure(fg_color="transparent"))
+        if self.view_mode == "list":
+            for movie_id, title, folder_path in movies:
+                is_selected = (movie_id == self.current_selected_movie_id)
+                base_color = "#9C27B0" if is_selected else "transparent"
+                hover_color = ("#7B1FA2", "#9C27B0") if is_selected else ("#333333", "#555555")
+                movie_frame = ctk.CTkFrame(self.movie_list_frame, corner_radius=5, fg_color=base_color)
+                movie_frame.pack(pady=2, padx=5, fill="x")
+                movie_frame.bind("<Button-1>", lambda e, mid=movie_id: self.show_movie_details(mid))
+                movie_frame.bind("<Button-2>", lambda e, path=folder_path: self.open_folder_in_explorer(path))
+                title_var = ctk.StringVar(value=title)
+                title_entry = ctk.CTkEntry(movie_frame, textvariable=title_var, state="normal", border_width=0,
+                                           fg_color="transparent", font=ctk.CTkFont(size=14))
+                title_entry.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+                title_entry.configure(state="readonly")  # Set to readonly after packing to allow selection
+                title_entry.bind("<Button-1>", lambda e, mid=movie_id: self.show_movie_details(mid))
+                title_entry.bind("<Button-2>", lambda e, path=folder_path: self.open_folder_in_explorer(path))
+                title_entry.bind("<Button-3>", lambda e, w=title_entry: self._handle_title_right_click(e, w))
+                self.bind_all_children(title_entry, "<Control-c>", lambda e, w=title_entry: self._copy_to_clipboard(w))
+                def on_enter(event, w=movie_frame, sel=is_selected, hc=hover_color, mid=movie_id, te=title_entry):
+                    # Don't change the background color on hover
+                    # Only show preview
+                    if self.preview_after_id:
+                        self.after_cancel(self.preview_after_id)
+                    self.preview_after_id = self.after(200, lambda: self.show_preview(mid, te))
+
+                def on_leave(event, w=movie_frame, sel=is_selected, bc=base_color):
+                    # Check if this is the currently selected movie
+                    is_current = False
+                    if self.current_selected_movie_id is not None:
+                        for child in w.winfo_children():
+                            if isinstance(child, ctk.CTkEntry):
+                                movie_title = child.get()
+                                details = get_movie_details(self.current_selected_movie_id)
+                                if details and details["title"] == movie_title:
+                                    is_current = True
+                    
+                    if is_current:
+                        w.configure(fg_color="#9C27B0")
+                    else:
+                        w.configure(fg_color="transparent")
+                        
+                    if self.preview_after_id:
+                        self.after_cancel(self.preview_after_id)
+                        self.preview_after_id = None
+                    self.hide_preview()
+                movie_frame.bind("<Enter>", on_enter)
+                movie_frame.bind("<Leave>", on_leave)
+                title_entry.bind("<Enter>", on_enter)
+                title_entry.bind("<Leave>", on_leave)
+        else:  # grid view
+            self.grid_container = ctk.CTkFrame(self.movie_list_frame)
+            self.grid_container.pack(fill="both", expand=True)
+            columns = 4
+            thumb_size = (100, 150)
+            row = 0
+            col = 0
+            for movie_id, title, folder_path in movies:
+                is_selected = (movie_id == self.current_selected_movie_id)
+                base_color = "#9C27B0" if is_selected else "#222222"
+                hover_color = ("#7B1FA2", "#9C27B0") if is_selected else ("#333333", "#555555")
+                grid_frame = ctk.CTkFrame(self.grid_container, corner_radius=8, fg_color=base_color, width=120, height=210)
+                grid_frame.grid(row=row, column=col, padx=10, pady=10, sticky="n")
+                grid_frame.grid_propagate(False)
+                details = get_movie_details(movie_id)
+                poster_path = details.get("poster_path") if details else None
+                if poster_path and os.path.exists(poster_path):
+                    try:
+                        pil_image = Image.open(poster_path)
+                        poster_image = ctk.CTkImage(pil_image, size=thumb_size)
+                        poster_label = ctk.CTkLabel(grid_frame, image=poster_image, text="")
+                        poster_label.pack(pady=(10, 5))
+                        poster_label._image = poster_image
+                    except Exception:
+                        poster_label = ctk.CTkLabel(grid_frame, text="No Poster")
+                        poster_label.pack(pady=(10, 5))
+                else:
+                    poster_label = ctk.CTkLabel(grid_frame, text="No Poster")
+                    poster_label.pack(pady=(10, 5))
+                title_var = ctk.StringVar(value=title)
+                title_entry = ctk.CTkEntry(grid_frame, textvariable=title_var, state="normal",
+                                           font=ctk.CTkFont(size=13, weight="bold"), border_width=0,
+                                           fg_color="transparent", justify="center")
+                title_entry.pack(pady=(0, 10), padx=5, fill="x")
+                title_entry.configure(state="readonly")  # Set to readonly after packing to allow selection
+                title_entry.bind("<Button-1>", lambda e, mid=movie_id: self.show_movie_details(mid))
+                title_entry.bind("<Button-2>", lambda e, path=folder_path: self.open_folder_in_explorer(path))
+                
+                # Bind events to poster_label
+                poster_label.bind("<Button-1>", lambda e, mid=movie_id: self.show_movie_details(mid))
+                poster_label.bind("<Button-2>", lambda e, path=folder_path: self.open_folder_in_explorer(path))
+                
+                # Bind events to title_entry
+                title_entry.bind("<Button-1>", lambda e, mid=movie_id: self.show_movie_details(mid))
+                title_entry.bind("<Button-2>", lambda e, path=folder_path: self.open_folder_in_explorer(path))
+                title_entry.bind("<Button-3>", lambda e, w=title_entry: self._handle_title_right_click(e, w))
+                self.bind_all_children(title_entry, "<Control-c>", lambda e, w=title_entry: self._copy_to_clipboard(w))
+                
+                # Hover effects
+                grid_frame.bind("<Enter>", lambda e, w=grid_frame, sel=is_selected, mid=movie_id: self._on_grid_enter_updated(w, sel, mid))
+                grid_frame.bind("<Leave>", lambda e, w=grid_frame, sel=is_selected: self._on_grid_leave_updated(w, sel))
+                poster_label.bind("<Enter>", lambda e, w=grid_frame, sel=is_selected, mid=movie_id: self._on_grid_enter_updated(w, sel, mid))
+                poster_label.bind("<Leave>", lambda e, w=grid_frame, sel=is_selected: self._on_grid_leave_updated(w, sel))
+                title_entry.bind("<Enter>", lambda e, w=grid_frame, sel=is_selected, mid=movie_id: self._on_grid_enter_updated(w, sel, mid))
+                title_entry.bind("<Leave>", lambda e, w=grid_frame, sel=is_selected: self._on_grid_leave_updated(w, sel))
+                
+                # Remove these duplicate bindings
+                # grid_frame.bind("<Button-1>", functools.partial(self._on_grid_click, movie_id))
+                # grid_frame.bind("<Button-2>", lambda e, path=folder_path: self.open_folder_in_explorer(path))
+                # poster_label.bind("<Button-1>", functools.partial(self._on_grid_click, movie_id))
+                col += 1
+                if col >= columns:
+                    col = 0
+                    row += 1
+
+    def _on_grid_enter_updated(self, grid_frame, is_selected, movie_id):
+        # Don't change the background color on hover
+        # Only show preview
+        if self.preview_after_id:
+            self.after_cancel(self.preview_after_id)
+        self.preview_after_id = self.after(200, lambda: self.show_preview(movie_id, grid_frame))
+
+    def _on_grid_leave_updated(self, grid_frame, is_selected):
+        # Re-check if this is the currently selected movie
+        is_current = False
+        if self.current_selected_movie_id is not None:
+            for child in grid_frame.winfo_children():
+                if isinstance(child, ctk.CTkEntry):
+                    movie_title = child.get()
+                    details = get_movie_details(self.current_selected_movie_id)
+                    if details and details["title"] == movie_title:
+                        is_current = True
+        
+        if is_current:
+            grid_frame.configure(fg_color="#9C27B0")
+        else:
+            grid_frame.configure(fg_color="#222222")
+            
+        if self.preview_after_id:
+            self.after_cancel(self.preview_after_id)
+            self.preview_after_id = None
+        self.hide_preview()
 
     def disable_details_buttons(self):
         self.set_poster_button.configure(state="disabled")
@@ -285,7 +464,10 @@ class App(ctk.CTk):
         self.set_video_button.configure(state="normal")
         self.set_gallery_button.configure(state="normal")
         details = get_movie_details(movie_id)
-        if not details: return
+        if not details:
+            self.current_folder_path = None
+            return
+        self.current_folder_path = details.get("folder_path")  # сохраняем путь
         poster_path = details.get("poster_path")
         if poster_path and os.path.exists(poster_path):
             try:
@@ -312,12 +494,50 @@ class App(ctk.CTk):
                                       text_color="gray")
             info_label.pack(pady=20)
         else:
-            for file_path in details["files"]:
-                file_name = os.path.basename(file_path)
-                file_label = ctk.CTkLabel(self.details_files_scrollable_frame, text=file_name, anchor="w",
-                                          cursor="hand2")
-                file_label.pack(anchor="w", padx=10, pady=2)
-                file_label.bind("<Button-1>", lambda e, path=file_path: self.play_file(path))
+            video_files = [f for f in details["files"] if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS]
+            if not video_files:
+                info_label = ctk.CTkLabel(self.details_files_scrollable_frame, text="No video files found.",
+                                          text_color="gray")
+                info_label.pack(pady=20)
+            else:
+                for file_path in video_files:
+                    file_name = os.path.basename(file_path)
+                    file_label = ctk.CTkLabel(self.details_files_scrollable_frame, text=file_name, anchor="w",
+                                              cursor="hand2")
+                    file_label.pack(anchor="w", padx=10, pady=2)
+                    file_label.bind("<Button-1>", lambda e, path=file_path: self.play_file(path))
+        self.update_selection_highlight()
+
+    def update_selection_highlight(self):
+        # Обновляет выделение выбранного элемента без пересоздания всего списка/сетки
+        if self.view_mode == "list":
+            for widget in self.movie_list_frame.winfo_children():
+                if widget is self.toggle_view_button or widget is self.grid_container:
+                    continue
+                if isinstance(widget, ctk.CTkFrame):
+                    is_selected = False
+                    for child in widget.winfo_children():
+                        if isinstance(child, ctk.CTkEntry):
+                            movie_title = child.get()
+                            if self.current_selected_movie_id is not None:
+                                details = get_movie_details(self.current_selected_movie_id)
+                                if details and details["title"] == movie_title:
+                                    is_selected = True
+                    widget.configure(fg_color="#9C27B0" if is_selected else "transparent")
+        else:
+            if self.grid_container is not None:
+                for grid_frame in self.grid_container.winfo_children():
+                    if not isinstance(grid_frame, ctk.CTkFrame):
+                        continue
+                    is_selected = False
+                    for child in grid_frame.winfo_children():
+                        if isinstance(child, ctk.CTkEntry):
+                            movie_title = child.get()
+                            if self.current_selected_movie_id is not None:
+                                details = get_movie_details(self.current_selected_movie_id)
+                                if details and details["title"] == movie_title:
+                                    is_selected = True
+                    grid_frame.configure(fg_color="#9C27B0" if is_selected else "#222222")
 
     def bind_all_children(self, widget, sequence, func):
         widget.bind(sequence, func)
@@ -401,6 +621,94 @@ class App(ctk.CTk):
             print(f"Title from folder {folder_path} already exists in the database.")
         finally:
             conn.close()
+
+    def show_preview(self, movie_id, widget):
+        details = get_movie_details(movie_id)
+        if not details:
+            return
+        if not widget.winfo_exists():
+            return
+        if self.preview_window is None or not self.preview_window.winfo_exists():
+            self.preview_window = ctk.CTkToplevel(self)
+            self.preview_window.overrideredirect(True)
+            self.preview_window.attributes("-topmost", True)
+            self.preview_window.withdraw()
+            self.preview_poster_label = ctk.CTkLabel(self.preview_window, text="No Poster")
+            self.preview_poster_label.pack(padx=10, pady=5)
+            self.preview_title_label = ctk.CTkLabel(self.preview_window, text="", font=ctk.CTkFont(size=14, weight="bold"))
+            self.preview_title_label.pack(padx=10, pady=(0, 5))
+            self.preview_tags_label = ctk.CTkLabel(self.preview_window, text="", font=ctk.CTkFont(size=12))
+            self.preview_tags_label.pack(padx=10, pady=(0, 10))
+        poster_path = details.get("poster_path")
+        if poster_path and os.path.exists(poster_path):
+            try:
+                pil_image = Image.open(poster_path)
+                poster_image = ctk.CTkImage(pil_image, size=(120, 180))
+                self.preview_poster_label.configure(image=poster_image, text="")
+                self.preview_poster_label.image = poster_image
+            except Exception:
+                self.preview_poster_label.configure(image=None, text="No Poster")
+        else:
+            self.preview_poster_label.configure(image=None, text="No Poster")
+        self.preview_title_label.configure(text=details["title"])
+        tags = details["tags"]
+        self.preview_tags_label.configure(text=f"Tags: {', '.join(tags) if tags else 'None'}")
+        x = widget.winfo_rootx() + widget.winfo_width() + 10
+        y = widget.winfo_rooty()
+        self.preview_window.geometry(f"250x260+{x}+{y}")
+        self.preview_window.deiconify()
+        self.preview_window.lift()
+
+    def hide_preview(self):
+        if self.preview_window and self.preview_window.winfo_exists():
+            self.preview_window.withdraw()
+
+    def toggle_view_mode(self):
+        if self.view_mode == "list":
+            self.view_mode = "grid"
+            self.toggle_view_button.configure(text="List View")
+        else:
+            self.view_mode = "list"
+            self.toggle_view_button.configure(text="Grid View")
+        self.refresh_movie_list()
+
+    def open_current_movie_folder(self, event):
+        if self.current_folder_path and os.path.exists(self.current_folder_path):
+            self.open_folder_in_explorer(self.current_folder_path)
+
+    def _handle_title_right_click(self, event, widget):
+        self.context_menu.show(event, widget)
+        return "break"  # Останавливаем распространение события
+
+    def _copy_to_clipboard(self, widget):
+        try:
+            text = widget.get()
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            print(f"Copied to clipboard: {text}")
+        except Exception as e:
+            print(f"Could not copy text: {e}")
+
+    def _handle_global_copy(self, event):
+        """Handle global Ctrl+C event by copying selected text if any"""
+        try:
+            selected_widget = self.focus_get()
+            if isinstance(selected_widget, ctk.CTkEntry):
+                # CTkEntry doesn't have selection_present method, so we'll use the underlying tkinter widget
+                try:
+                    # Try to get selected text directly from the tkinter widget
+                    selected_text = selected_widget.selection_get()
+                    self.clipboard_clear()
+                    self.clipboard_append(selected_text)
+                    print(f"Copied selected text: {selected_text}")
+                except:
+                    # If no selection, copy the entire text
+                    text = selected_widget.get()
+                    self.clipboard_clear()
+                    self.clipboard_append(text)
+                    print(f"Copied entire text: {text}")
+        except Exception as e:
+            print(f"Error handling copy: {e}")
 
 
 if __name__ == "__main__":
